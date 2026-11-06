@@ -48,4 +48,4 @@ python LineDensityCleanUp_dxf.py *.dxf --width 6.5in --layers Visible
 - **What is checked:** lines, arcs, circles, ellipses, splines, and polylines. Text, dimensions, hatches, and other entities pass through unchanged.
 - **Block references** are exploded into individual lines so each one can be checked. Use `--no-explode` to keep blocks intact.
 - **Settings** are at the top of `LineDensityCleanUp_dxf.py` and match the Illustrator script's settings.
-- **Speed:** about 7 seconds for a 6,000-line test drawing and about 90 seconds for 30,000 lines on a 2-core machine. Time grows with total line length at final size.
+- **Speed:** a real SolidWorks export with about 28,000 lines took about 11 seconds on a 2-core machine. Very dense generated test drawings took longer (about 90 seconds for 30,000 lines). Time grows with total line length at final size.
