@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-LineDensityCleanUp for DXF  (v1)
+LineDensityCleanUp for DXF  (v2)
 
 Removes duplicate, near-parallel and leftover fragment lines from a DXF *before* it goes into
 Illustrator. Same detection logic and the same distances as the Illustrator script
@@ -9,7 +9,11 @@ LineDensityCleanUp v5 (Illustrator/LineDensityCleanUp_v5.jsx).
 The input DXF is never changed. For each input file it writes:
     <name>_clean.dxf    the drawing without the removed lines (import this into Illustrator)
     <name>_review.dxf   everything; removed lines moved to colored layers LDC_Duplicates,
-                        LDC_Near-parallel, LDC_Fragments (and LDC_Stubs) so you can check them
+                        LDC_Near-parallel, LDC_Fragments (and LDC_Stubs) so you can check them;
+                        gap bridges on LDC_Bridges
+v2: closes small gaps where a kept line stops just short of another kept line, both gaps the
+    cleanup created (by removing a connecting line) and gaps already in the export. Each gap gets
+    a short straight bridge line. --no-bridge gives the v1 result.
 
 Distances in SETTINGS are in points at the figure's FINAL printed size, exactly as in the
 Illustrator script. Tell the script the final size with --width (e.g. 4in, 100mm, 288pt) or give
@@ -48,6 +52,12 @@ SETTINGS = {
     "removeStubs": False, "stubMaxLength": 0.6, "stubDist": 0.15, "stubCoverage": 0.9,
     "flattenStep": 0.05,
     "sampleStep": 0.05,
+
+    # v2: close small gaps where a kept line stops just short of another kept line
+    "bridgeGaps": True,
+    "gapMax": 0.5,               # largest gap to close (pt)
+    "bridgeMaxAngleDeg": 60,     # a bridge must leave the line end within this angle of the line's own direction
+    "bridgeAnyAngleBelow": 0.05, # gaps shorter than this (pt) are closed in any direction
 }
 # -----------------------------------------------------------------------------------------------------------------
 
@@ -598,6 +608,153 @@ def ldc_run(paths, S, progress=None):
 
 
 # =====================================================================================================
+# v2: gap bridging (not in the Illustrator script)
+# A "dangling end" is an end of a kept open line that touches no other kept line (within touchTol).
+# It is bridged with a short straight line when something it should meet lies within gapMax:
+#   1. another dangling end, facing it         -> end-to-end bridge (closest pairs first)
+#   2. a kept line straight ahead of it        -> the line is extended to meet it
+#   3. the nearest point of a kept line, within bridgeMaxAngleDeg of the line's direction
+# "created" = the end used to touch a line this script removed; otherwise the gap was in the original.
+# =====================================================================================================
+
+def ldc_bridges(paths, verdict, S):
+    gapMax = S["gapMax"]
+    touchTol = S["touchTol"]
+    snap = S["bridgeAnyAngleBelow"]
+    cosA = math.cos(S["bridgeMaxAngleDeg"] * math.pi / 180)
+    n = len(paths)
+    pts = [None] * n
+    for i in range(n):
+        if verdict[i] != "dup":
+            pts[i] = ldc_flatten(paths[i]["pp"], paths[i]["closed"], S["flattenStep"])
+
+    # Ends of kept open lines, with outward direction
+    ends = []   # [path, x, y, ox, oy]
+    for i in range(n):
+        p = pts[i]
+        if verdict[i] != "keep" or p is None or len(p) < 4 or paths[i]["closed"]:
+            continue
+        if ldc_dist(p[0], p[1], p[-2], p[-1]) <= touchTol:
+            continue   # closed loop drawn as an open line
+        d0 = ldc_end_dir(p, True, S["dirBack"])
+        d1 = ldc_end_dir(p, False, S["dirBack"])
+        ends.append((i, p[0], p[1], d0[0], d0[1]))
+        ends.append((i, p[-2], p[-1], d1[0], d1[1]))
+    if not ends:
+        return [], 0
+
+    sg = LDCSegGrid(max(gapMax, S["touchTol"] * 4, 0.2))
+    c = sg.cell
+    only = set()
+    for (i, x, y, ox, oy) in ends:
+        cx = _floor(x / c); cy = _floor(y / c)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                only.add((cx + di, cy + dj))
+    sg.only = only
+    F = sg.COARSE
+    sg.coarse = set((x // F, y // F) for (x, y) in only)
+    for i in range(n):
+        if pts[i] is not None:
+            sg.add_path(i, pts[i])
+
+    dangling = []   # (path, x, y, ox, oy, created)
+    for (i, x, y, ox, oy) in ends:
+        if sg.touches(x, y, touchTol, i, verdict, 0):
+            continue
+        dangling.append((i, x, y, ox, oy, sg.touches(x, y, touchTol, i, verdict, 1)))
+
+    def facing(ox, oy, vx, vy, d):
+        return d <= snap or (ox * vx + oy * vy) / d >= cosA
+
+    # 1. End to end
+    eg = {}
+    for k, (i, x, y, ox, oy, cr) in enumerate(dangling):
+        eg.setdefault((_floor(x / c), _floor(y / c)), []).append(k)
+    pairs = []
+    lens = {}
+    for a, (ia, xa, ya, oxa, oya, cra) in enumerate(dangling):
+        cx = _floor(xa / c); cy = _floor(ya / c)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                for b in eg.get((cx + di, cy + dj), ()):
+                    if b <= a:
+                        continue
+                    ib, xb, yb, oxb, oyb, crb = dangling[b]
+                    vx = xb - xa; vy = yb - ya
+                    d = _sqrt(vx * vx + vy * vy)
+                    if d > gapMax:
+                        continue
+                    if ia == ib:   # the two ends of one line: only close it if the line is long
+                        if ia not in lens:
+                            lens[ia] = ldc_length(pts[ia])
+                        if lens[ia] <= 4 * gapMax:
+                            continue
+                    if facing(oxa, oya, vx, vy, d) and facing(oxb, oyb, -vx, -vy, d):
+                        pairs.append((d, a, b))
+    pairs.sort()
+    used = set()
+    bridges = []
+    for d, a, b in pairs:
+        if a in used or b in used:
+            continue
+        used.add(a); used.add(b)
+        ia, xa, ya, _, _, cra = dangling[a]
+        ib, xb, yb, _, _, crb = dangling[b]
+        bridges.append({"path": ia, "x0": xa, "y0": ya, "x1": xb, "y1": yb, "kind": "end", "created": cra or crb})
+
+    # 2./3. End to line
+    for k, (i, x, y, ox, oy, cr) in enumerate(dangling):
+        if k in used:
+            continue
+        cx = _floor(x / c); cy = _floor(y / c)
+        best_ray = None    # (t, hx, hy)
+        best_near = None   # (d, qx, qy)
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                arr = sg.map.get((cx + di, cy + dj))
+                if arr is None:
+                    continue
+                for q in range(0, len(arr), 5):
+                    id_ = arr[q]
+                    if id_ == i or verdict[id_] != "keep":
+                        continue
+                    ax = arr[q + 1]; ay = arr[q + 2]; bx = arr[q + 3]; by = arr[q + 4]
+                    sx = bx - ax; sy = by - ay
+                    # ray x + t*o hits segment a + u*s ?
+                    den = ox * sy - oy * sx
+                    if abs(den) > 1e-12:
+                        wx = ax - x; wy = ay - y
+                        t = (wx * sy - wy * sx) / den
+                        u = (wx * oy - wy * ox) / den
+                        if 0 <= u <= 1 and 0 < t <= gapMax and (best_ray is None or t < best_ray[0]):
+                            best_ray = (t, x + t * ox, y + t * oy)
+                    # nearest point on the segment
+                    L2 = sx * sx + sy * sy
+                    u = 0
+                    if L2 > 0:
+                        u = ((x - ax) * sx + (y - ay) * sy) / L2
+                        u = 0 if u < 0 else (1 if u > 1 else u)
+                    qx = ax + u * sx; qy = ay + u * sy
+                    vx = qx - x; vy = qy - y
+                    d = _sqrt(vx * vx + vy * vy)
+                    if d <= gapMax and facing(ox, oy, vx, vy, d) and (best_near is None or d < best_near[0]):
+                        best_near = (d, qx, qy)
+        if best_near is not None and best_near[0] <= snap:
+            tx, ty = best_near[1], best_near[2]
+        elif best_ray is not None:
+            tx, ty = best_ray[1], best_ray[2]
+        elif best_near is not None:
+            tx, ty = best_near[1], best_near[2]
+        else:
+            continue
+        used.add(k)
+        bridges.append({"path": i, "x0": x, "y0": y, "x1": tx, "y1": ty, "kind": "line", "created": cr})
+
+    return bridges, len(dangling) - len(used)
+
+
+# =====================================================================================================
 # DXF side
 # =====================================================================================================
 
@@ -607,6 +764,7 @@ REASON_LAYERS = {
     "orphan": ("LDC_Fragments", 6),      # magenta
     "stub": ("LDC_Stubs", 3),            # green
 }
+BRIDGE_LAYER = ("LDC_Bridges", 4)     # cyan
 REASON_NAMES = {"dup": "Duplicates", "near": "Near-parallel", "orphan": "Fragments", "stub": "Stubs"}
 
 # Entity types read as lines. Everything else (text, dimensions, hatches, points...) is left untouched.
@@ -691,6 +849,7 @@ def process_file(src, width_pt, scale, layers, S, explode=True, out_dir=None, qu
     layouts = [doc.modelspace()] + [l for l in doc.layouts if not l.is_modelspace]
     report = []
     removed_entities = []   # (entity, reason, layout)
+    bridges = []            # (layout, source entity, x0, y0, x1, y1) in drawing units
     any_geometry = False
 
     for layout in layouts:
@@ -745,7 +904,20 @@ def process_file(src, width_pt, scale, layers, S, explode=True, out_dir=None, qu
             if v != "keep":
                 counts[v] += 1
                 removed_entities.append((ents[idx], v, layout))
-        report.append((layout.name, len(ents), counts))
+        # v2: bridge small gaps between the kept lines
+        nb = {"end": 0, "line": 0, "created": 0, "existing": 0, "left": 0}
+        if S.get("bridgeGaps"):
+            eff = [("keep" if ent_v.get(idx) == "keep" else v) for v, idx in zip(verdict, owner)]
+            br, left = ldc_bridges(paths, eff, S)
+            nb["left"] = left
+            for b in br:
+                src_e = ents[owner[b["path"]]]
+                bridges.append((layout, src_e, b["x0"] / s, b["y0"] / s, b["x1"] / s, b["y1"] / s))
+                nb[b["kind"]] += 1
+                nb["created" if b["created"] else "existing"] += 1
+            log("   Bridged %d gaps (%d created by the cleanup, %d already in the file); %d line ends left open"
+                % (len(br), nb["created"], nb["existing"], left))
+        report.append((layout.name, len(ents), counts, nb))
 
     if not any_geometry:
         names = sorted(l.dxf.name for l in doc.layers)
@@ -767,32 +939,51 @@ def process_file(src, width_pt, scale, layers, S, explode=True, out_dir=None, qu
         e.dxf.color = 256          # BYLAYER, so the reason color shows
         if e.dxf.hasattr("true_color"):
             e.dxf.discard("true_color")
+    # Bridges: in the review file on their own layer, in the clean file on the source line's layer
+    new_bridges = []
+    if bridges:
+        if BRIDGE_LAYER[0] not in doc.layers:
+            doc.layers.add(BRIDGE_LAYER[0], color=BRIDGE_LAYER[1])
+        for layout, src_e, x0, y0, x1, y1 in bridges:
+            new_bridges.append((layout.add_line((x0, y0), (x1, y1), dxfattribs={"layer": BRIDGE_LAYER[0], "color": 256}), src_e))
     doc.saveas(review_path)
 
     # Clean file: removed lines deleted
     for e, v, layout in removed_entities:
         layout.delete_entity(e)
-    for name, _ in REASON_LAYERS.values():
+    for b, src_e in new_bridges:
+        b.dxf.layer = src_e.dxf.layer
+        for attr in ("color", "true_color", "linetype", "lineweight"):
+            if src_e.dxf.hasattr(attr):
+                b.dxf.set(attr, src_e.dxf.get(attr))
+    for name, _ in list(REASON_LAYERS.values()) + [BRIDGE_LAYER]:
         if name in doc.layers:
             doc.layers.remove(name)
     doc.saveas(clean_path)
 
     lines = ["LineDensityCleanUp (DXF) finished in %.1f s" % (time.time() - t0), "File: " + src]
     tot = {"dup": 0, "near": 0, "orphan": 0, "stub": 0}
+    btot = {"end": 0, "line": 0, "created": 0, "existing": 0, "left": 0}
     checked = 0
-    for name, n, c in report:
+    for name, n, c, nb in report:
         checked += n
         for k in tot:
             tot[k] += c[k]
+        for k in btot:
+            btot[k] += nb[k]
     lines.append("Lines checked: %d" % checked)
     for k in ("dup", "near", "orphan", "stub"):
         if k != "stub" or tot[k]:
             lines.append("%s removed: %d" % (REASON_NAMES[k], tot[k]))
+    if S.get("bridgeGaps"):
+        lines.append("Gaps bridged: %d (%d created by the cleanup, %d already in the file)"
+                     % (btot["created"] + btot["existing"], btot["created"], btot["existing"]))
+        lines.append("Line ends still open: %d" % btot["left"])
     lines.append("Clean file:  " + clean_path)
     lines.append("Review file: " + review_path)
     if not quiet:
         print("\n" + "\n".join(lines) + "\n")
-    return {"checked": checked, "removed": tot, "clean": clean_path, "review": review_path}
+    return {"checked": checked, "removed": tot, "bridges": btot, "clean": clean_path, "review": review_path}
 
 
 def main(argv=None):
@@ -806,6 +997,8 @@ def main(argv=None):
     ap.add_argument("--scale", type=float, help="instead of --width: points per drawing unit at final size")
     ap.add_argument("--layers", help="only clean these DXF layers, comma-separated (default: all layers)")
     ap.add_argument("--no-explode", action="store_true", help="leave block references alone (their lines are not checked)")
+    ap.add_argument("--gap", help="largest gap to bridge, e.g. 0.5pt (default %gpt)" % SETTINGS["gapMax"])
+    ap.add_argument("--no-bridge", action="store_true", help="do not bridge gaps (same output as v1)")
     ap.add_argument("--out-dir", help="folder for the output files (default: next to each input)")
     args = ap.parse_args(argv)
 
@@ -832,8 +1025,13 @@ def main(argv=None):
     except ImportError:
         sys.exit("This script needs the ezdxf library. Install it with:  pip install ezdxf")
 
+    S = dict(SETTINGS)
+    if args.no_bridge:
+        S["bridgeGaps"] = False
+    if args.gap:
+        S["gapMax"] = parse_length_pt(args.gap if args.gap.strip()[-1].isalpha() else args.gap + "pt")
     for f in files:
-        process_file(f, width_pt, args.scale, layers, SETTINGS, explode=not args.no_explode, out_dir=args.out_dir)
+        process_file(f, width_pt, args.scale, layers, S, explode=not args.no_explode, out_dir=args.out_dir)
 
 
 if __name__ == "__main__":

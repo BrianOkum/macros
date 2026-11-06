@@ -13,10 +13,12 @@ Files: [`DXF/LineDensityCleanUp_dxf.py`](DXF/LineDensityCleanUp_dxf.py), [`DXF/L
 
 A Python version of LineDensityCleanUp that cleans the DXF *before* it is imported into Illustrator. It uses the same detection logic and the same settings as the Illustrator script (exact duplicates, near-parallel lines, and leftover fragments), so Illustrator only receives the lines you keep. Tested to give identical results to the Illustrator script's logic on the same geometry.
 
+**v2 adds gap bridging.** After the cleanup, a line that stops just short of another line (0.5 pt or less at final size) gets a short bridge line so the two meet. This covers gaps the cleanup creates (when it removes the line that connected two others) and gaps already in the CAD export. Closed outlines make Live Paint, joining, and silhouette work in Illustrator more reliable. Use `--no-bridge` to get the v1 result.
+
 The original DXF is not changed. For each file, the script writes:
 
 - `<name>_clean.dxf`: the drawing with the removed lines taken out. Import this into Illustrator.
-- `<name>_review.dxf`: the full drawing, with removed lines moved to colored layers (`LDC_Duplicates` in red, `LDC_Near-parallel` in blue, `LDC_Fragments` in magenta) so you can check what was taken out.
+- `<name>_review.dxf`: the full drawing, with removed lines moved to colored layers (`LDC_Duplicates` in red, `LDC_Near-parallel` in blue, `LDC_Fragments` in magenta) and bridges on `LDC_Bridges` in cyan, so you can check every change.
 
 ### Setup (once)
 
@@ -39,6 +41,8 @@ python LineDensityCleanUp_dxf.py *.dxf --width 6.5in --layers Visible
 | `--width` | Final printed width of the figure: `4in`, `100mm`, `288pt`. A bare number is read as inches. |
 | `--scale` | Instead of `--width`: points per drawing unit at final size. |
 | `--layers` | Clean only these DXF layers (comma-separated). Default: all layers. |
+| `--gap` | Largest gap to bridge: `0.5pt` (default), `0.3pt`. A bare number is read as points. |
+| `--no-bridge` | Do not bridge gaps (v1 behavior). |
 | `--no-explode` | Leave block references alone. Their lines are then not checked. |
 | `--out-dir` | Write the output files to this folder instead of next to each input. |
 
@@ -47,5 +51,7 @@ python LineDensityCleanUp_dxf.py *.dxf --width 6.5in --layers Visible
 - **Why the width matters.** The tolerances are in points at the figure's final printed size, as in the Illustrator script (for example, lines within 0.4 pt of each other count as near-parallel). A DXF is drawn at full scale, so the script needs the final width to convert those tolerances. If you later import the clean DXF at a different size, the cleanup will have been tuned for the wrong size.
 - **What is checked:** lines, arcs, circles, ellipses, splines, and polylines. Text, dimensions, hatches, and other entities pass through unchanged.
 - **Block references** are exploded into individual lines so each one can be checked. Use `--no-explode` to keep blocks intact.
-- **Settings** are at the top of `LineDensityCleanUp_dxf.py` and match the Illustrator script's settings.
+- **Gap size.** On a real SolidWorks export, bridges longer than about 1 pt were usually wrong: they connected a line that is meant to end to a neighboring line. Raise `--gap` above 0.5 pt only if you check the result in the review file.
+- **Bridges are straight lines** on the same layer as the line they extend. In the clean file they touch the lines on both sides, but they are separate paths; use Join in Illustrator if you need one continuous path.
+- **Settings** are at the top of `LineDensityCleanUp_dxf.py` and match the Illustrator script's settings (the gap-bridging settings are new in v2).
 - **Speed:** a real SolidWorks export with about 28,000 lines took about 11 seconds on a 2-core machine. Very dense generated test drawings took longer (about 90 seconds for 30,000 lines). Time grows with total line length at final size.
